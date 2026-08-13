@@ -172,18 +172,22 @@ func (m model) composerDividerLine(width int) string {
 	// footer for run-state), so they're not duplicated on this rule.
 	meta := zeroTheme.muted.Render(model)
 	metaWidth := lipgloss.Width(meta)
+	reserved := m.petComposerReservedColumns(width)
+	availableWidth := width - reserved
 	if width < 8 {
 		return zeroTheme.lineStrong.Render(strings.Repeat("─", width))
 	}
-	if width < metaWidth+4 {
-		return zeroTheme.lineStrong.Render("╰" + strings.Repeat("─", width-2) + "╯")
+	if availableWidth < metaWidth+4 {
+		line := zeroTheme.lineStrong.Render("╰" + strings.Repeat("─", availableWidth-2) + "╯")
+		return line + strings.Repeat(" ", reserved)
 	}
-	rule := strings.Repeat("─", width-metaWidth-4)
-	return zeroTheme.lineStrong.Render("╰"+rule+" ") + meta + zeroTheme.lineStrong.Render(" ╯")
+	rule := strings.Repeat("─", availableWidth-metaWidth-4)
+	line := zeroTheme.lineStrong.Render("╰"+rule+" ") + meta + zeroTheme.lineStrong.Render(" ╯")
+	return line + strings.Repeat(" ", reserved)
 }
 
 // statusLine renders the bottom readout as ` │ `-separated groups: the run-state
-// chip (permission mode + effort) on the left, a flexible gap, then the
+// chip (permission mode + effort/fast tier) on the left, a flexible gap, then the
 // context-fill gauge and token/cost usage on the right. The provider lives in the
 // title bar and is NOT duplicated here. Groups drop with the width tier.
 func (m model) statusLine(width int) string {
@@ -220,6 +224,9 @@ func (m model) statusLine(width int) string {
 	// Non-tiny: append the active reasoning effort (brand lime, omitted on auto).
 	if m.reasoningEffort != "" {
 		left += zeroTheme.muted.Render(" · ") + zeroTheme.accent.Render(string(m.reasoningEffort))
+	}
+	if m.activeServiceTier() == "priority" {
+		left += zeroTheme.muted.Render(" · ") + zeroTheme.accent.Render("fast")
 	}
 	if m.exitConfirmActive {
 		left = prefix + btwChip + zeroTheme.amber.Render("●") + " " + zeroTheme.amber.Render(ctrlCExitConfirmText)
@@ -796,6 +803,9 @@ func (m model) pickerOverlay(width int) string {
 	}
 	if m.picker.kind == pickerModel {
 		return m.modelPickerOverlay(width)
+	}
+	if m.picker.kind == pickerPet {
+		return m.petPickerOverlay(width)
 	}
 	overlayWidth := minInt(width, pickerOverlayMaxWidth)
 	if overlayWidth < pickerOverlayMinWidth {

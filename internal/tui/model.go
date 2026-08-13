@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Gitlawb/zero/internal/agent"
@@ -33,6 +35,7 @@ import (
 	"github.com/Gitlawb/zero/internal/sessions"
 	"github.com/Gitlawb/zero/internal/skills"
 	"github.com/Gitlawb/zero/internal/streamjson"
+	"github.com/Gitlawb/zero/internal/terminalpet"
 	"github.com/Gitlawb/zero/internal/tools"
 	"github.com/Gitlawb/zero/internal/usage"
 	"github.com/Gitlawb/zero/internal/usercommands"
@@ -148,6 +151,7 @@ type model struct {
 	unsafeArmed      bool
 	selfCorrectTests bool
 	reasoningEffort  modelregistry.ReasoningEffort
+	serviceTier      string
 	// Active execution profile (set by /profile; applies to the NEXT run).
 	// The displaced/applied pairs let a switch or /profile balanced restore
 	// exactly what the profile replaced while leaving later manual overrides
@@ -165,6 +169,48 @@ type model struct {
 	execProfileEffortTouched      bool
 	execProfileSelfCorrectTouched bool
 	responseStyle                 string
+	petClient                     *terminalpet.Client
+	petRenderer                   *terminalpet.ImageRenderer
+	petEntries                    map[string]terminalpet.Entry
+	petID                         string
+	petName                       string
+	petAnimation                  *terminalpet.Animation
+	petPreview                    *terminalpet.Animation
+	petPreviewSlug                string
+	petPreviewError               string
+	petPreviewLoading             bool
+	petPreviewSeq                 uint64
+	petPreviewCancel              context.CancelFunc
+	petRequestedSlug              string
+	petPhase                      int
+	petTickSeq                    uint64
+	petPlaybackState              terminalpet.State
+	petClickAnimationIndex        int
+	petOutcome                    terminalpet.State
+	petOutcomeAt                  time.Time
+	petLayoutRendering            bool
+	petPositionSet                bool
+	petPositionX                  int
+	petPositionY                  int
+	petDragActive                 bool
+	petDragMoved                  bool
+	petDragStartedDocked          bool
+	petDragOffsetX                int
+	petDragOffsetY                int
+	petDragTargetX                int
+	petDragTargetY                int
+	petDragTargetOffsetX          int
+	petDragTargetOffsetY          int
+	petPositionOffsetX            int
+	petPositionOffsetY            int
+	petCellPixelWidth             int
+	petCellPixelHeight            int
+	petPixelDrag                  bool
+	petPixelAnchorSet             bool
+	petDragOffsetPixelX           int
+	petDragOffsetPixelY           int
+	petDragState                  terminalpet.State
+	petLastClickAt                time.Time
 	keyBindings                   keyBindings
 	themeMode                     themeMode // palette preference: auto (default), dark, light
 	hasDarkBg                     bool      // last terminal background-detection result (auto mode)
@@ -946,6 +992,8 @@ func newModel(ctx context.Context, options Options) model {
 		permissionMode:              permissionMode,
 		reasoningEffort:             options.ReasoningEffort,
 		responseStyle:               defaultedResponseStyle(options.ResponseStyle),
+		petEntries:                  map[string]terminalpet.Entry{},
+		petID:                       strings.TrimSpace(options.SavedPet),
 		keyBindings:                 resolvedKeyBindings,
 		themeMode:                   resolveThemeMode(options.Theme, os.Getenv("ZERO_THEME"), options.SavedTheme),
 		hasDarkBg:                   true,
@@ -968,6 +1016,22 @@ func newModel(ctx context.Context, options Options) model {
 		setup:                       newSetupState(options.Setup),
 		setupSave:                   options.Setup.Save,
 		dictation:                   newDictationController(options),
+	}
+	petRoot := userConfigDir
+	if strings.TrimSpace(options.UserConfigPath) != "" {
+		petRoot = filepath.Dir(options.UserConfigPath)
+	}
+	if strings.TrimSpace(petRoot) != "" {
+		m.petClient = terminalpet.NewClient(petRoot)
+		if m.petID != "" && m.petID != terminalpet.DisabledID {
+			if animation, loadErr := m.petClient.LoadInstalled(m.petID); loadErr == nil {
+				m.petAnimation = animation
+				m.petName = m.petID
+				if entry, entryErr := m.petClient.InstalledEntry(m.petID); entryErr == nil {
+					m.petName = entry.Label()
+				}
+			}
+		}
 	}
 	// Apply an explicit theme immediately; auto stays on the dark default until
 	// Init's terminal background probe resolves it (see Init / BackgroundColorMsg).
@@ -1051,6 +1115,17 @@ func composerBlinkCmd() tea.Cmd {
 
 func (m model) Init() tea.Cmd {
 	cmds := []tea.Cmd{textinput.Blink, composerBlinkCmd()}
+	if m.petAnimation != nil && !m.reducedMotion {
+		cmds = append(cmds, petTickCmd(m.petTickSeq, m.petFrameDelay()))
+	}
+	// Every image protocol wants this, not just the ones that support pixel
+	// dragging. Sixel needs it most: it erases itself by writing over cells, so
+	// without the pixels-per-cell figure it cannot know how many cells it
+	// covered, and falls back to constants describing the reserved area rather
+	// than the image.
+	if m.petCellMetricsWanted() {
+		cmds = append(cmds, tea.Raw(ansi.WindowOp(16)))
+	}
 	// Bubble Tea documents an initial WindowSizeMsg as delivered automatically
 	// on program start, so m.height/m.width are normally set before the first
 	// render. But that's the terminal proactively pushing a size — if it's
@@ -1252,6 +1327,12 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return next, cmd
 	}
 	switch msg := msg.(type) {
+	case uv.CellSizeEvent:
+		if msg.Width > 0 && msg.Height > 0 {
+			m.petCellPixelWidth = msg.Width
+			m.petCellPixelHeight = msg.Height
+		}
+		return m, nil
 	case peerMessageMsg:
 		admitted := m.canAcceptPeerMessage(msg.message)
 		if msg.admit != nil {
@@ -1420,6 +1501,19 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyPressMsg:
+		if m.petDragActive {
+			pixelDrag := m.petPixelDrag
+			if !keyIs(msg, tea.KeyEsc) && !keyCtrl(msg, 'c') {
+				return m, nil
+			}
+			m.cancelPetDrag()
+			m.lastKeyTime = time.Time{}
+			m.burstCount = 0
+			if pixelDrag {
+				return m, petPixelMouseDisableCmd()
+			}
+			return m, nil
+		}
 		// Paste-detection timing trackers. MUST run before any early return
 		// so burst counting stays accurate regardless of which branch fires.
 		now := m.now()
@@ -1639,6 +1733,9 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// A live theme preview was applied while navigating; restore the
 					// committed palette since Esc dismisses without choosing.
 					m.restoreCommittedTheme()
+				}
+				if m.picker.kind == pickerPet {
+					m.cancelPetPreview()
 				}
 				m.picker = nil
 				return m, nil
@@ -1883,6 +1980,9 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Editing the filter changes which row is highlighted; keep the
 				// theme preview in sync with it (no-op for other pickers).
 				m.previewSelectedTheme()
+				if m.picker.kind == pickerPet {
+					return m.schedulePetPreview()
+				}
 				return m, nil
 			}
 			// On an empty composer, Backspace removes the last attachment chip
@@ -2105,6 +2205,9 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Filtering changes the highlighted row; keep the theme preview in
 				// sync with it (no-op for other pickers).
 				m.previewSelectedTheme()
+				if m.picker.kind == pickerPet {
+					return m.schedulePetPreview()
+				}
 			}
 			return m, nil
 		}
@@ -2133,12 +2236,22 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.BlurMsg:
+		var petMouseCmd tea.Cmd
+		if m.petDragActive {
+			pixelDrag := m.petPixelDrag
+			m.cancelPetDrag()
+			m.lastKeyTime = time.Time{}
+			m.burstCount = 0
+			if pixelDrag {
+				petMouseCmd = petPixelMouseDisableCmd()
+			}
+		}
 		m.terminalFocused = false
 		m.composerCursorVisible = false
 		if m.notifier != nil {
 			m.notifier.SetFocused(false)
 		}
-		return m, nil
+		return m, petMouseCmd
 	case toolCallStreamStartMsg:
 		if msg.runID != m.activeRunID {
 			return m, nil
@@ -2309,6 +2422,7 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.WindowSizeMsg:
+		m.resizeFreePetPosition(m.width, m.height, msg.Width, msg.Height)
 		m.width = msg.Width
 		m.height = msg.Height
 		// A resize re-wraps content at a new width, shifting every row's bodyY;
@@ -2467,6 +2581,12 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.clearStreamingToolCall() // active run finished — drop any lingering "writing" block
+		if msg.err != nil {
+			m.petOutcome = terminalpet.Failed
+		} else {
+			m.petOutcome = terminalpet.Review
+		}
+		m.petOutcomeAt = m.now()
 		m.pending = false
 		m = m.disarmCancelConfirmation() // the run finished on its own — nothing left to confirm cancelling
 		// A newline-triggered redraw deferred by the stream-clear throttle
@@ -2855,6 +2975,34 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applySetupOAuthDeviceCode(msg)
 	case modelPickerModelsDiscoveredMsg:
 		return m.applyModelPickerModelsDiscovered(msg), nil
+	case petCatalogLoadedMsg:
+		return m.applyPetCatalog(msg)
+	case petPreviewDebounceMsg:
+		return m.startPetPreview(msg)
+	case petPreviewLoadedMsg:
+		m = m.applyPetPreview(msg)
+		if m.petPreview != nil && m.petAnimation == nil && !m.reducedMotion {
+			m.petTickSeq++
+			return m, petTickCmd(m.petTickSeq, m.petFrameDelay())
+		}
+		return m, nil
+	case petInstalledMsg:
+		return m.applyPetInstall(msg)
+	case petTickMsg:
+		if msg.seq != m.petTickSeq {
+			return m, nil
+		}
+		if (m.petAnimation == nil && (m.picker == nil || m.petPreview == nil)) || m.reducedMotion {
+			return m, nil
+		}
+		_, state := m.petPlayback()
+		if state != m.petPlaybackState {
+			m.petPlaybackState = state
+			m.petPhase = 0
+		} else {
+			m.petPhase++
+		}
+		return m, petTickCmd(m.petTickSeq, m.petFrameDelay())
 	case ollamaContextWindowDiscoveredMsg:
 		if msg.err == nil && msg.contextWindow > 0 {
 			if m.ollamaContextWindowByModel == nil {
@@ -2883,6 +3031,9 @@ func (m model) View() tea.View {
 		content = m.transcriptView()
 	} else {
 		content = m.detailedTranscriptView()
+	}
+	if m.petRenderer != nil {
+		m.petRenderer.Set(m.petImageDraw(content))
 	}
 
 	view := tea.NewView(content)
@@ -2955,6 +3106,9 @@ func (m model) transcriptView() string {
 	// sidebar row-by-row. The subchat drill-in keeps its own single-column view.
 	if m.sidebarActive() && !m.subchat.active {
 		return m.twoColumnTranscriptView()
+	}
+	if m.petLayoutActive() {
+		return m.floatingPetTranscriptView()
 	}
 
 	width := chatWidth(m.width)
@@ -3060,7 +3214,6 @@ func (m model) twoColumnTranscriptView() string {
 
 	header := m.pinnedTitleBar(width)
 	chatBlock := viewLines(m.scrollableTranscriptItemsView(header, bodyItems, footer, width, overlayForViewport))
-
 	sidebar := m.renderContextSidebar(sidebarW, len(chatBlock))
 	rows := joinColumns(chatBlock, sidebar, chatW, sidebarW)
 	return strings.Join(rows, "\n")
@@ -3088,7 +3241,7 @@ func (m model) footerView(width int) string {
 	if m.renamePrompt != nil {
 		footer.WriteString(m.sessionRenamePromptView(width))
 		footer.WriteString("\n")
-		footer.WriteString(m.statusLine(width))
+		footer.WriteString(m.footerStatusLine(width))
 		return footer.String()
 	}
 	// While an ask-user questionnaire is active it REPLACES the composer box (the
@@ -3097,7 +3250,7 @@ func (m model) footerView(width int) string {
 	if m.pendingAskUser != nil {
 		footer.WriteString(renderAskUserQuestionnaire(*m.pendingAskUser, m.input.Value(), width))
 		footer.WriteString("\n")
-		footer.WriteString(m.statusLine(width))
+		footer.WriteString(m.footerStatusLine(width))
 		return footer.String()
 	}
 	// A focused permission prompt owns the keyboard: its options (and the feedback
@@ -3107,7 +3260,7 @@ func (m model) footerView(width int) string {
 	// input from echoing in two places once "tell Zero what to do differently"
 	// opens the on-card feedback field.
 	if m.pendingPermission != nil {
-		footer.WriteString(m.statusLine(width))
+		footer.WriteString(m.footerStatusLine(width))
 		return footer.String()
 	}
 	// Pinned plan panel: sits directly above the composer so it stays visible
@@ -3148,7 +3301,7 @@ func (m model) footerView(width int) string {
 		footer.WriteString(hint)
 	}
 	footer.WriteString("\n")
-	footer.WriteString(m.statusLine(width))
+	footer.WriteString(m.footerStatusLine(width))
 	return footer.String()
 }
 
@@ -4172,23 +4325,26 @@ func (m model) composerBox(width int) string {
 	if width < 8 {
 		return fitStyledLine(m.composerLine(width), width)
 	}
-	innerWidth := maxInt(1, width-4)
+	reserved := m.petComposerReservedColumns(width)
+	boxWidth := width - reserved
+	innerWidth := maxInt(1, boxWidth-4)
 	content := m.composerLine(innerWidth)
 	lines := strings.Split(content, "\n")
+	rightPad := strings.Repeat(" ", reserved)
 
 	rendered := make([]string, 0, len(lines)+3)
-	rendered = append(rendered, zeroTheme.lineStrong.Render("╭"+strings.Repeat("─", width-2)+"╮"))
+	rendered = append(rendered, zeroTheme.lineStrong.Render("╭"+strings.Repeat("─", boxWidth-2)+"╮")+rightPad)
 	// Attachment chips ([Image #1] …) render INSIDE the box, above the input line,
 	// instead of as a separate row above the box.
 	if chips := renderAttachmentChips(m.pendingImageLabels, m.pendingDocuments); chips != "" {
 		fitted := fitStyledLine(zeroTheme.muted.Render(chips), innerWidth)
 		pad := strings.Repeat(" ", maxInt(0, innerWidth-lipgloss.Width(fitted)))
-		rendered = append(rendered, zeroTheme.lineStrong.Render("│ ")+fitted+pad+zeroTheme.lineStrong.Render(" │"))
+		rendered = append(rendered, zeroTheme.lineStrong.Render("│ ")+fitted+pad+zeroTheme.lineStrong.Render(" │")+rightPad)
 	}
 	for _, line := range lines {
 		fitted := fitStyledLine(line, innerWidth)
 		pad := strings.Repeat(" ", maxInt(0, innerWidth-lipgloss.Width(fitted)))
-		rendered = append(rendered, zeroTheme.lineStrong.Render("│ ")+fitted+pad+zeroTheme.lineStrong.Render(" │"))
+		rendered = append(rendered, zeroTheme.lineStrong.Render("│ ")+fitted+pad+zeroTheme.lineStrong.Render(" │")+rightPad)
 	}
 	rendered = append(rendered, m.composerDividerLine(width))
 	return strings.Join(rendered, "\n")
@@ -4395,6 +4551,8 @@ func (m model) choosePicker() (tea.Model, tea.Cmd) {
 		}
 	case pickerSTTDownload:
 		return m.handleSTTDownloadSelection(item.Value)
+	case pickerPet:
+		return m.installPet(item.Value)
 	case pickerTheme:
 		// The hovered palette is already live from the preview; handleThemeCommand
 		// records the choice (m.themeMode) and re-applies it, and reports the switch.
@@ -4551,6 +4709,8 @@ func (m model) dispatchCommand(command parsedCommand) (tea.Model, tea.Cmd) {
 		return m.handleLoopCommand(command.text)
 	case commandGoal:
 		return m.handleGoalCommand(command.text)
+	case commandPets:
+		return m.handlePetsCommand(command.text)
 	case commandExit:
 		// Closing the session stops its foreground loops mid-task; warn once so a
 		// token-spending loop isn't ended by reflex.
@@ -4727,6 +4887,11 @@ func (m model) dispatchCommand(command parsedCommand) (tea.Model, tea.Cmd) {
 		}
 		text := ""
 		m, text = m.handleEffortCommand(command.text)
+		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: text})
+		return m, nil
+	case commandFast:
+		text := ""
+		m, text = m.handleFastCommand(command.text)
 		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: text})
 		return m, nil
 	case commandStyle:
@@ -5297,6 +5462,7 @@ func (m model) runAgentWithOptions(runID int, runCtx context.Context, prompt str
 		options.ProviderName = m.providerName
 		options.Model = m.modelName
 		options.ReasoningEffort = string(m.reasoningEffort)
+		options.ServiceTier = m.activeServiceTier()
 		options.ResponseStyle = m.responseStyle
 		options.Cwd = m.cwd
 		options.Images = images

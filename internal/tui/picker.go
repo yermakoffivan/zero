@@ -14,6 +14,7 @@ import (
 	"github.com/Gitlawb/zero/internal/providercatalog"
 	"github.com/Gitlawb/zero/internal/providermodelcatalog"
 	"github.com/Gitlawb/zero/internal/providermodeldiscovery"
+	"github.com/Gitlawb/zero/internal/providers"
 )
 
 // pickerKind identifies which command a picker selection feeds back into.
@@ -27,6 +28,7 @@ const (
 	pickerSkill
 	pickerSTTModel
 	pickerSTTDownload
+	pickerPet
 )
 
 // pickerItem is one selectable row: Label is shown, Value is passed to the
@@ -406,8 +408,9 @@ func (m model) modelPickerProviderDiscoveryCmd(descriptor providercatalog.Descri
 	needOAuth := key == "" && descriptor.OAuth && !descriptor.OAuthMintsKey
 	discover := m.discoverProviderModels
 	if discover == nil {
+		discoveryOptions := m.modelPickerDiscoveryOptions(authed)
 		discover = func(ctx context.Context, p config.ProviderProfile) ([]providermodeldiscovery.Model, error) {
-			return providermodeldiscovery.DiscoverCatalog(ctx, descriptor, p, providermodeldiscovery.Options{})
+			return providermodeldiscovery.DiscoverCatalog(ctx, descriptor, p, discoveryOptions)
 		}
 	}
 	providerID := descriptor.ID
@@ -422,6 +425,15 @@ func (m model) modelPickerProviderDiscoveryCmd(descriptor providercatalog.Descri
 		}
 		models, err := discover(ctx, providerWizardDiscoveryProfile(descriptor, k, authed.BaseURL))
 		return modelPickerModelsDiscoveredMsg{providerID: providerID, models: models, err: err}
+	}
+}
+
+func (m model) modelPickerDiscoveryOptions(profile config.ProviderProfile) providermodeldiscovery.Options {
+	oauthResolver, loginKey := providers.OAuthLoginForProfile(profile)
+	return providermodeldiscovery.Options{
+		OAuthResolver:        oauthResolver,
+		CodexAccountResolver: providers.CodexAccountResolverForLogin(loginKey),
+		UserAgent:            m.userAgent,
 	}
 }
 
@@ -1029,10 +1041,14 @@ func (m model) newThemePicker() *commandPicker {
 // repaints the UI in the hovered palette. Safe to call with no picker open. Callers
 // mutate through m.picker (a pointer) and the global theme, so the value receiver
 // is fine.
-func (m model) pickerMoved(delta int) {
+func (m model) pickerMoved(delta int) (model, tea.Cmd) {
 	if m.picker == nil {
-		return
+		return m, nil
 	}
 	m.picker.move(delta)
 	m.previewSelectedTheme()
+	if m.picker.kind == pickerPet {
+		return m.schedulePetPreview()
+	}
+	return m, nil
 }

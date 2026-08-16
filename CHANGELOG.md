@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once the first release is
 tagged. Until then, source builds report the version `dev`.
 
+## [0.8.0](https://github.com/Gitlawb/zero/compare/v0.7.0...v0.8.0) (2026-08-16)
+
+
+### Features
+
+* **security:** path-jail primitive, credential-store locking, worktree git hardening ([#891](https://github.com/Gitlawb/zero/issues/891)) ([060d38c](https://github.com/Gitlawb/zero/commit/060d38ce716feb7c5b6657b082cd35cb8dda3d75))
+* **zerogit:** auto-create a conventional branch before push/pr on default branch ([#671](https://github.com/Gitlawb/zero/issues/671)) ([d065467](https://github.com/Gitlawb/zero/commit/d065467cd3ec3ed91c5dc60554c36fc4b4d6de4c))
+
+
+### Bug Fixes
+
+* bump Go to 1.26.6 for stdlib vulnerability fixes ([#903](https://github.com/Gitlawb/zero/issues/903)) ([dc15e82](https://github.com/Gitlawb/zero/commit/dc15e822987d8d7de467c62c375518f435b74d8c))
+* **daemon:** clean up child after startup timeout ([#774](https://github.com/Gitlawb/zero/issues/774)) ([9c29209](https://github.com/Gitlawb/zero/commit/9c292092a26c9092fd873d072b0af1b0d9d39ef0))
+* **dictation:** redact API keys from streaming transcriber errors ([#852](https://github.com/Gitlawb/zero/issues/852)) ([64a783b](https://github.com/Gitlawb/zero/commit/64a783b08caa2c7b21f188033b9ed84a14e00e84))
+* **providers:** discover ChatGPT capabilities ([#890](https://github.com/Gitlawb/zero/issues/890)) ([2d2450e](https://github.com/Gitlawb/zero/commit/2d2450e9a744349f0d01b1d4e9ba29c24ba5650d))
+
 ## [0.7.0](https://github.com/Gitlawb/zero/compare/v0.6.0...v0.7.0) (2026-08-10)
 
 
